@@ -1,0 +1,34 @@
+[package]
+name = "obi-indexer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+obi-core = { workspace = true }
+obi-llm = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+uuid = { workspace = true }
+
+# Tree-sitter
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-go = { workspace = true }
+
+# File watching
+notify = { workspace = true }
+notify-debouncer-mini = { workspace = true }
+
+# Vector storage
+lancedb = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+futures = { workspace = true }

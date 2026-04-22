@@ -1,0 +1,20 @@
+[package]
+name = "obi-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+obi-core = { workspace = true }
+obi-llm = { workspace = true }
+obi-indexer = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+regex = "1"
+shell-words = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

@@ -1,0 +1,239 @@
+use std::path::Path;
+
+use obi_core::node::{Language, NodeType};
+use tree_sitter::Parser;
+
+use super::{CallSite, LanguageParser, RawNode};
+
+pub struct RustParser;
+
+impl LanguageParser for RustParser {
+    fn language(&self) -> Language {
+        Language::Rust
+    }
+
+    fn file_extensions(&self) -> &[&str] {
+        &["rs"]
+    }
+
+    fn extract_nodes(&self, source: &str, _path: &Path) -> Vec<RawNode> {
+        let (nodes, _tree) = self.parse_with_tree(source, None);
+        nodes
+    }
+
+    fn extract_nodes_incremental(
+        &self,
+        source: &str,
+        _path: &Path,
+        old_tree: Option<&tree_sitter::Tree>,
+    ) -> (Vec<RawNode>, Option<tree_sitter::Tree>) {
+        self.parse_with_tree(source, old_tree)
+    }
+
+    fn resolve_imports(&self, source: &str) -> Vec<String> {
+        let mut parser = Parser::new();
+        let lang = tree_sitter_rust::LANGUAGE;
+        parser
+            .set_language(&lang.into())
+            .expect("failed to set Rust grammar");
+
+        let tree = match parser.parse(source, None) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        let mut imports = Vec::new();
+        Self::walk_imports(tree.root_node(), source, &mut imports);
+        imports
+    }
+
+    fn resolve_calls(&self, source: &str) -> Vec<CallSite> {
+        let mut parser = Parser::new();
+        let lang = tree_sitter_rust::LANGUAGE;
+        parser
+            .set_language(&lang.into())
+            .expect("failed to set Rust grammar");
+
+        let tree = match parser.parse(source, None) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        let mut calls = Vec::new();
+        Self::walk_calls(tree.root_node(), source, &mut calls);
+        calls
+    }
+}
+
+impl RustParser {
+    fn parse_with_tree(
+        &self,
+        source: &str,
+        old_tree: Option<&tree_sitter::Tree>,
+    ) -> (Vec<RawNode>, Option<tree_sitter::Tree>) {
+        let mut parser = Parser::new();
+        let lang = tree_sitter_rust::LANGUAGE;
+        parser
+            .set_language(&lang.into())
+            .expect("failed to set Rust grammar");
+
+        let tree = match parser.parse(source, old_tree) {
+            Some(t) => t,
+            None => return (Vec::new(), None),
+        };
+
+        let mut nodes = Vec::new();
+        Self::walk_nodes(tree.root_node(), source, &mut nodes);
+        (nodes, Some(tree))
+    }
+
+    fn walk_nodes(node: tree_sitter::Node, source: &str, out: &mut Vec<RawNode>) {
+        match node.kind() {
+            "function_item" | "function_signature_item" => {
+                if let Some(name) = Self::child_by_field(&node, "name", source) {
+                    out.push(RawNode {
+                        name,
+                        node_type: NodeType::Function,
+                        content: node.utf8_text(source.as_bytes()).unwrap_or("").to_string(),
+                        line_start: node.start_position().row,
+                        line_end: node.end_position().row,
+                    });
+                }
+            }
+            "struct_item" => {
+                if let Some(name) = Self::child_by_field(&node, "name", source) {
+                    out.push(RawNode {
+                        name,
+                        node_type: NodeType::Struct,
+                        content: node.utf8_text(source.as_bytes()).unwrap_or("").to_string(),
+                        line_start: node.start_position().row,
+                        line_end: node.end_position().row,
+                    });
+                }
+            }
+            "enum_item" => {
+                if let Some(name) = Self::child_by_field(&node, "name", source) {
+                    out.push(RawNode {
+                        name,
+                        node_type: NodeType::Struct, // enum treated as struct-like
+                        content: node.utf8_text(source.as_bytes()).unwrap_or("").to_string(),
+                        line_start: node.start_position().row,
+                        line_end: node.end_position().row,
+                    });
+                }
+            }
+            "trait_item" => {
+                if let Some(name) = Self::child_by_field(&node, "name", source) {
+                    out.push(RawNode {
+                        name,
+                        node_type: NodeType::Trait,
+                        content: node.utf8_text(source.as_bytes()).unwrap_or("").to_string(),
+                        line_start: node.start_position().row,
+                        line_end: node.end_position().row,
+                    });
+                }
+            }
+            "impl_item" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "declaration_list" {
+                        let mut inner_cursor = child.walk();
+                        for method in child.children(&mut inner_cursor) {
+                            if method.kind() == "function_item" {
+                                if let Some(name) = Self::child_by_field(&method, "name", source) {
+                                    out.push(RawNode {
+                                        name,
+                                        node_type: NodeType::Method,
+                                        content: method
+                                            .utf8_text(source.as_bytes())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        line_start: method.start_position().row,
+                                        line_end: method.end_position().row,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "const_item" | "static_item" => {
+                if let Some(name) = Self::child_by_field(&node, "name", source) {
+                    out.push(RawNode {
+                        name,
+                        node_type: NodeType::Constant,
+                        content: node.utf8_text(source.as_bytes()).unwrap_or("").to_string(),
+                        line_start: node.start_position().row,
+                        line_end: node.end_position().row,
+                    });
+                }
+            }
+            _ => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    Self::walk_nodes(child, source, out);
+                }
+            }
+        }
+    }
+
+    /// Extract imported names from `use` statements.
+    /// `use std::collections::HashMap;` → "HashMap"
+    /// `use crate::node::{NodeId, SemanticNode};` → "NodeId", "SemanticNode"
+    fn walk_imports(node: tree_sitter::Node, source: &str, out: &mut Vec<String>) {
+        if node.kind() == "use_declaration" {
+            let text = node.utf8_text(source.as_bytes()).unwrap_or("");
+            // Extract the last segment(s) from use paths
+            // Handle: use a::b::c; → "c"
+            // Handle: use a::b::{c, d}; → "c", "d"
+            let trimmed = text.trim().trim_start_matches("use ").trim_end_matches(';');
+            if let Some(brace_start) = trimmed.find('{') {
+                // use a::b::{c, d, e}
+                let inner = &trimmed[brace_start + 1..];
+                let inner = inner.trim_end_matches('}');
+                for item in inner.split(',') {
+                    let name = item.trim().split(" as ").last().unwrap_or("").trim();
+                    if !name.is_empty() && name != "self" && name != "*" {
+                        out.push(name.to_string());
+                    }
+                }
+            } else {
+                // use a::b::c or use a::b::c as d
+                let final_part = trimmed.split(" as ").last().unwrap_or(trimmed).trim();
+                let name = final_part.rsplit("::").next().unwrap_or(final_part);
+                if !name.is_empty() && name != "self" && name != "*" {
+                    out.push(name.to_string());
+                }
+            }
+        } else {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                Self::walk_imports(child, source, out);
+            }
+        }
+    }
+
+    fn walk_calls(node: tree_sitter::Node, source: &str, out: &mut Vec<CallSite>) {
+        if node.kind() == "call_expression" {
+            if let Some(func) = node.child_by_field_name("function") {
+                let name = func.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                // Strip path prefix: foo::bar::baz -> baz
+                let short_name = name.rsplit("::").next().unwrap_or(&name).to_string();
+                out.push(CallSite {
+                    caller_line: node.start_position().row,
+                    callee_name: short_name,
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::walk_calls(child, source, out);
+        }
+    }
+
+    fn child_by_field(node: &tree_sitter::Node, field: &str, source: &str) -> Option<String> {
+        node.child_by_field_name(field)
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(|s| s.to_string())
+    }
+}

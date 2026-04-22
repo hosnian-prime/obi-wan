@@ -1,0 +1,8 @@
+pub mod backlinks;
+pub mod chat;
+pub mod command;
+pub mod editor;
+pub mod file_tree;
+pub mod graph;
+pub mod notification;
+pub mod settings;

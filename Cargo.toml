@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/obi-core",
+    "crates/obi-tui",
+    "crates/obi-indexer",
+    "crates/obi-llm",
+    "crates/obi-agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+obi-core = { path = "crates/obi-core" }
+obi-indexer = { path = "crates/obi-indexer" }
+obi-llm = { path = "crates/obi-llm" }
+obi-agent = { path = "crates/obi-agent" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# TUI
+ratatui = "0.30"
+crossterm = "0.28"
+
+# IDs and hashing
+uuid = { version = "1", features = ["v4", "serde"] }
+blake3 = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Tree-sitter (parsing)
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+
+# File watching
+notify = "7"
+notify-debouncer-mini = "0.5"
+
+# Vector storage
+lancedb = "0.26"
+
+# HTTP (for LLM API calls)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Arrow (for LanceDB record batches)
+arrow-array = "57"
+arrow-schema = "57"
+futures = "0.3"
+
+# Parallel computation
+rayon = "1.10"
+
+# Config file parsing
+toml = "0.8"
+
+# Time / chrono
+chrono = { version = "0.4", features = ["serde"] }
+
+# Directories (home dir)
+dirs = "6"
+
+# Shell command parsing (for shell-free direct execution)
+shell-words = "1"

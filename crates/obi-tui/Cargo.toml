@@ -1,0 +1,22 @@
+[package]
+name = "obi-tui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "obi"
+path = "src/main.rs"
+
+[dependencies]
+obi-core = { workspace = true }
+obi-indexer = { workspace = true }
+obi-llm = { workspace = true }
+obi-agent = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rayon = { workspace = true }
+chrono = { workspace = true }
+toml = { workspace = true }

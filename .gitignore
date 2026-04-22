@@ -1,0 +1,22 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Dependencies
+Cargo.lock
+
+# IDE
+.idea/
+.obi/
+.vscode/
+*.swp
+*.swo
+*~
+docs/*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Obi-Wan local data
+.obi/db/
