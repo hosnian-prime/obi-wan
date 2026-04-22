@@ -2,6 +2,8 @@
 
 **Your code has a story. Obi-Wan remembers it.**
 
+![Obi-Wan Terminal IDE](screen.png)
+
 Obi-Wan is an AI-native terminal IDE that builds a persistent knowledge graph of your codebase. When you ask the AI a question, it doesn't dump entire files into the context window — it finds exactly the functions, structs, and relationships that matter, and sends only those.
 
 **~95% fewer tokens per query. Same quality answers. Fraction of the cost.**
@@ -233,6 +235,10 @@ pub fn parse(tokens: Vec<Token>) -> Ast { ... }
 ```
 
 ---
+
+## Status
+
+> **Obi-Wan is under active development.** Features, APIs, and configuration formats may change. Contributions and feedback are welcome.
 
 ## License
 
