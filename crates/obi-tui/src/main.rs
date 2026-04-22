@@ -5,10 +5,13 @@ mod widgets;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use obi_llm::provider::EmbeddingProvider;
+use tokio::sync::mpsc;
 
 use app::App;
 
@@ -422,6 +425,214 @@ async fn cmd_brain_status() -> Result<()> {
     println!();
     println!("Merged: {} nodes, {} edges", stats.merged_node_count, stats.merged_edge_count);
     println!("Project boost: {}x", config.brain.project_boost);
+
+    Ok(())
+}
+
+/// Run indexing pipeline with progress events sent to the TUI.
+/// This reuses the same logic as `cmd_index` but reports progress via AppEvent.
+pub(crate) async fn run_index_with_progress(
+    project_root: PathBuf,
+    tx: mpsc::UnboundedSender<event::AppEvent>,
+    cancelled: Arc<AtomicBool>,
+) {
+    let result = run_index_inner(project_root, &tx, &cancelled).await;
+    match result {
+        Ok(()) => {
+            let _ = tx.send(event::AppEvent::IndexingComplete);
+        }
+        Err(e) => {
+            if cancelled.load(Ordering::Relaxed) {
+                // User cancelled — no error event needed
+            } else {
+                let _ = tx.send(event::AppEvent::IndexingError(e.to_string()));
+            }
+        }
+    }
+}
+
+async fn run_index_inner(
+    project_root: PathBuf,
+    tx: &mpsc::UnboundedSender<event::AppEvent>,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    let obi_dir = project_root.join(".obi");
+    std::fs::create_dir_all(&obi_dir)?;
+
+    let graph_path = obi_dir.join("graph.bin");
+    let db_path = obi_dir.join("db");
+
+    let _ = tx.send(event::AppEvent::IndexingStatus("Parsing files...".into()));
+
+    // Step 1: Parse
+    let config = obi_indexer::IndexConfig::default();
+    let mut result = obi_indexer::index_directory(&project_root, &config)?;
+
+    if cancelled.load(Ordering::Relaxed) {
+        anyhow::bail!("Cancelled");
+    }
+
+    // Step 2: Diff
+    let old_graph = if graph_path.exists() {
+        obi_core::graph::KnowledgeGraph::load_from_disk(&graph_path).ok()
+    } else {
+        None
+    };
+
+    let nodes_to_embed: HashMap<obi_core::node::NodeId, String>;
+    let mut removed_ids: Vec<obi_core::node::NodeId> = Vec::new();
+
+    if let Some(ref old) = old_graph {
+        let old_hashes: HashMap<String, [u8; 32]> = old
+            .nodes()
+            .map(|n| {
+                let key = format!("{}:{}", n.file_path.display(), n.name);
+                (key, n.content_hash)
+            })
+            .collect();
+
+        nodes_to_embed = result
+            .node_contents
+            .iter()
+            .filter(|(id, _)| {
+                let node = result.graph.get_node(id).unwrap();
+                let key = format!("{}:{}", node.file_path.display(), node.name);
+                match old_hashes.get(&key) {
+                    Some(old_hash) => *old_hash != node.content_hash,
+                    None => true,
+                }
+            })
+            .map(|(id, content)| (*id, content.clone()))
+            .collect();
+
+        let new_keys: HashSet<String> = result
+            .graph
+            .nodes()
+            .map(|n| format!("{}:{}", n.file_path.display(), n.name))
+            .collect();
+
+        removed_ids = old
+            .nodes()
+            .filter(|n| !new_keys.contains(&format!("{}:{}", n.file_path.display(), n.name)))
+            .map(|n| n.id)
+            .collect();
+    } else {
+        nodes_to_embed = result.node_contents.clone();
+    }
+
+    let total = nodes_to_embed.len();
+    let _ = tx.send(event::AppEvent::IndexingProgress { done: 0, total });
+    let _ = tx.send(event::AppEvent::IndexingStatus("Embedding nodes...".into()));
+
+    if cancelled.load(Ordering::Relaxed) {
+        anyhow::bail!("Cancelled");
+    }
+
+    // Step 3: Embed with progress
+    let provider = obi_llm::ollama::OllamaEmbedding::default_local();
+    let mut embeddings = HashMap::new();
+
+    if !nodes_to_embed.is_empty() {
+        let truncated: Vec<(obi_core::node::NodeId, String)> = nodes_to_embed
+            .iter()
+            .map(|(id, content)| {
+                let text = if content.len() > 30_000 {
+                    content[..30_000].to_string()
+                } else {
+                    content.clone()
+                };
+                (*id, text)
+            })
+            .collect();
+
+        let batch_size = provider.max_batch_size();
+        let mut done = 0_usize;
+
+        for chunk in truncated.chunks(batch_size) {
+            if cancelled.load(Ordering::Relaxed) {
+                anyhow::bail!("Cancelled");
+            }
+
+            let texts: Vec<&str> = chunk.iter().map(|(_, c)| c.as_str()).collect();
+            let ids: Vec<obi_core::node::NodeId> = chunk.iter().map(|(id, _)| *id).collect();
+
+            match provider.embed(&texts).await {
+                Ok(vecs) => {
+                    for (id, vec) in ids.into_iter().zip(vecs.into_iter()) {
+                        embeddings.insert(id, vec);
+                    }
+                }
+                Err(_) => {
+                    for (id, content) in chunk {
+                        match provider.embed(&[content.as_str()]).await {
+                            Ok(vecs) if !vecs.is_empty() => {
+                                embeddings.insert(*id, vecs.into_iter().next().unwrap());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            done += chunk.len();
+            let _ = tx.send(event::AppEvent::IndexingProgress { done, total });
+        }
+    }
+
+    let _ = tx.send(event::AppEvent::IndexingStatus("Storing in database...".into()));
+
+    // Step 4: Store in LanceDB
+    if !embeddings.is_empty() || !removed_ids.is_empty() {
+        match obi_indexer::store::VectorStore::open(&db_path, provider.dimensions()).await {
+            Ok(store) => {
+                if !removed_ids.is_empty() {
+                    let _ = store.delete(&removed_ids).await;
+                }
+                if !embeddings.is_empty() {
+                    let records: Vec<obi_indexer::store::NodeRecord> = embeddings
+                        .iter()
+                        .filter_map(|(id, embedding)| {
+                            let node = result.graph.get_node(id)?;
+                            let content = result.node_contents.get(id)?;
+                            Some(obi_indexer::store::NodeRecord {
+                                id: id.to_string(),
+                                name: node.name.clone(),
+                                content: content.clone(),
+                                file_path: node.file_path.to_string_lossy().to_string(),
+                                node_type: format!("{:?}", node.node_type),
+                                embedding: embedding.clone(),
+                            })
+                        })
+                        .collect();
+                    store.upsert(&records).await?;
+                }
+            }
+            Err(e) => {
+                anyhow::bail!("Failed to open LanceDB: {}", e);
+            }
+        }
+    }
+
+    let _ = tx.send(event::AppEvent::IndexingStatus("Resolving semantic edges...".into()));
+
+    // Step 5: Semantic edges
+    if !embeddings.is_empty() {
+        let node_ids: Vec<obi_core::node::NodeId> =
+            result.graph.all_nodes().keys().copied().collect();
+        let semantic_edges =
+            obi_indexer::edges::resolve_semantic_edges(&node_ids, &embeddings, 0.85);
+        for edge in semantic_edges {
+            result.graph.add_edge(edge);
+        }
+    }
+
+    // Step 6: Save graph
+    let _ = tx.send(event::AppEvent::IndexingStatus("Saving graph...".into()));
+    result.graph.save_to_disk(&graph_path)?;
+
+    // Step 7: Timestamp
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let _ = std::fs::write(obi_dir.join("last_indexed"), &timestamp);
 
     Ok(())
 }

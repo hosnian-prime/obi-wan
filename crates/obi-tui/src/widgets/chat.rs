@@ -669,7 +669,7 @@ impl ChatWidget {
             ("primary = ", Some("\"ollama\"")),
             ("", None),
             ("[llm.ollama]", None),
-            ("model = ", Some("\"qwen3.5:9b\"")),
+            ("model = ", Some("\"gemma4:e4b\"")),
             ("host = ", Some("\"http://localhost:11434\"")),
             ("", None),
             ("[embedding]", None),

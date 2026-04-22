@@ -144,6 +144,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.command_palette.render(frame, size);
     app.settings.render(frame, size);
 
+    // Indexing dialog overlay (highest priority)
+    app.indexing.render(frame, size);
+
     // Notification toast overlay
     app.notification.render(frame, size);
 }

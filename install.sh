@@ -17,7 +17,7 @@ RESET='\033[0m'
 
 OBI_CONFIG_DIR="$HOME/.obi"
 OBI_CONFIG_FILE="$OBI_CONFIG_DIR/config.toml"
-OLLAMA_MODEL="qwen3.5:9b"
+OLLAMA_MODEL="gemma4:e4b"
 EMBED_MODEL="nomic-embed-text"
 MIN_RUST_VERSION="1.75.0"
 
@@ -136,7 +136,7 @@ primary = "ollama"
 # fallback = "ollama"
 
 [llm.ollama]
-model = "qwen3.5:9b"
+model = "gemma4:e4b"
 host = "http://localhost:11434"
 
 [embedding]

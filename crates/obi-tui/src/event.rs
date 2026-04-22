@@ -18,6 +18,8 @@ pub enum AppEvent {
     NodesUpdated(Vec<NodeId>),
     IndexingProgress { done: usize, total: usize },
     IndexingComplete,
+    IndexingError(String),
+    IndexingStatus(String),
 
     // Agent (Phase 5)
     StreamChunk(String),

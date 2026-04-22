@@ -104,7 +104,7 @@ deps:
 	@printf "  ollama:  " && (ollama --version 2>/dev/null || echo "NOT FOUND — install from https://ollama.ai")
 	@echo ""
 	@echo "Required Ollama models:"
-	@echo "  ollama pull qwen3.5:9b        # Completion (32k context)"
+	@echo "  ollama pull gemma4:e4b         # Completion (32k context)"
 	@echo "  ollama pull nomic-embed-text    # Embeddings (768d)"
 	@echo ""
 	@echo "Pull models:"
@@ -112,7 +112,7 @@ deps:
 
 pull-models:
 	ollama pull nomic-embed-text
-	ollama pull qwen3.5:9b
+	ollama pull gemma4:e4b
 
 ollama:
 	@echo "Starting Ollama server..."

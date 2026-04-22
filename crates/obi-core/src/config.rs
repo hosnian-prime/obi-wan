@@ -146,7 +146,7 @@ impl Default for ProvidersConfig {
 impl OllamaConfig {
     fn default_completion() -> CompletionModelConfig {
         CompletionModelConfig {
-            model: "qwen3.5:9b".into(),
+            model: "gemma4:e4b".into(),
             max_context: 32768,
         }
     }
@@ -414,7 +414,7 @@ mod tests {
         let config = ObiConfig::default();
         assert_eq!(config.providers.completion, "ollama");
         assert_eq!(config.providers.embedding, "ollama");
-        assert_eq!(config.providers.ollama.completion.model, "qwen3.5:9b");
+        assert_eq!(config.providers.ollama.completion.model, "gemma4:e4b");
         assert_eq!(config.providers.ollama.embedding.model, "nomic-embed-text");
         assert_eq!(config.providers.anthropic.completion.model, "claude-sonnet-4-6");
         assert_eq!(config.providers.zai.completion.model, "glm-4.6");

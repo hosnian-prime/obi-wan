@@ -115,9 +115,9 @@ impl OllamaCompletion {
         }
     }
 
-    /// Default: localhost Ollama with qwen2.5:14b (32k context).
+    /// Default: localhost Ollama with gemma4:e4b (32k context).
     pub fn default_local() -> Self {
-        Self::new("http://localhost:11434", "qwen3.5:9b", 32768)
+        Self::new("http://localhost:11434", "gemma4:e4b", 32768)
     }
 
     fn build_chat_body(&self, req: &CompletionRequest, stream: bool) -> serde_json::Value {

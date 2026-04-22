@@ -4,5 +4,6 @@ pub mod command;
 pub mod editor;
 pub mod file_tree;
 pub mod graph;
+pub mod indexing;
 pub mod notification;
 pub mod settings;

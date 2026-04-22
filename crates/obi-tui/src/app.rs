@@ -14,6 +14,7 @@ use crate::widgets::command::CommandPalette;
 use crate::widgets::editor::{EditorMode, EditorWidget};
 use crate::widgets::file_tree::FileTreeWidget;
 use crate::widgets::graph::GraphWidget;
+use crate::widgets::indexing::{IndexingAction, IndexingDialog};
 use crate::widgets::notification::NotificationWidget;
 use crate::widgets::settings::{SettingsAction, SettingsWidget};
 
@@ -57,6 +58,8 @@ pub struct App {
     pub settings: SettingsWidget,
     /// Notification toast overlay.
     pub notification: NotificationWidget,
+    /// Indexing dialog overlay (shown on startup if index is missing).
+    pub indexing: IndexingDialog,
     /// Text selection drag state in chat.
     text_selecting: bool,
     /// Pending clipboard text to write via OSC 52 after next draw.
@@ -105,13 +108,34 @@ impl App {
         let mut graph = GraphWidget::new();
         let mut knowledge_graph = None;
 
+        // Check .obi consistency: both graph.bin and db must exist
+        let obi_dir = project_root.join(".obi");
+        let graph_path = obi_dir.join("graph.bin");
+        let db_path = obi_dir.join("db");
+        let graph_exists = graph_path.exists();
+        let db_exists = db_path.exists();
+
+        let needs_index = if !graph_exists || !db_exists {
+            // Inconsistent state: clean up partial .obi
+            if obi_dir.exists() && (graph_exists != db_exists) {
+                let _ = std::fs::remove_dir_all(&obi_dir);
+            }
+            true
+        } else {
+            false
+        };
+
         // Try to load existing knowledge graph from .obi/graph.bin
-        let graph_path = project_root.join(".obi").join("graph.bin");
         if graph_path.exists() {
             if let Ok(kg) = KnowledgeGraph::load_from_disk(&graph_path) {
                 graph.load_graph(kg.clone());
                 knowledge_graph = Some(Arc::new(kg));
             }
+        }
+
+        let mut indexing = IndexingDialog::new();
+        if needs_index {
+            indexing.show_prompt();
         }
 
         // Spawn the agent task
@@ -177,6 +201,7 @@ impl App {
             panel_boundaries: PanelBoundaries::default(),
             settings: SettingsWidget::new(),
             notification: NotificationWidget::new(),
+            indexing,
             text_selecting: false,
             pending_clipboard: None,
         }
@@ -268,12 +293,25 @@ impl App {
             AppEvent::Key(key) => self.handle_key(key),
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
             AppEvent::Quit => self.running = false,
+            AppEvent::IndexingProgress { done, total } => {
+                self.indexing.update_progress(done, total);
+            }
             AppEvent::IndexingComplete => {
                 let graph_path = self.project_root.join(".obi").join("graph.bin");
                 if let Ok(kg) = KnowledgeGraph::load_from_disk(&graph_path) {
                     self.graph.update_graph(kg.clone());
                     self.knowledge_graph = Some(Arc::new(kg));
+                    // Reload agent with the new graph
+                    let _ = self.agent_cmd_tx.send(AgentCommand::ReloadConfig);
                 }
+                self.indexing.set_complete();
+                self.notification.show("Indexing complete");
+            }
+            AppEvent::IndexingError(err) => {
+                self.indexing.set_error(err);
+            }
+            AppEvent::IndexingStatus(text) => {
+                self.indexing.set_status(text);
             }
             AppEvent::NodesUpdated(_ids) => {
                 let graph_path = self.project_root.join(".obi").join("graph.bin");
@@ -364,7 +402,30 @@ impl App {
         }
     }
 
+    fn start_indexing(&mut self) {
+        let cancel = self.indexing.start_progress();
+        let tx = self.event_tx.clone();
+        let root = self.project_root.clone();
+        tokio::spawn(async move {
+            crate::run_index_with_progress(root, tx, cancel).await;
+        });
+    }
+
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
+        // Indexing dialog intercepts all input when visible
+        if self.indexing.visible {
+            match self.indexing.handle_key(key) {
+                IndexingAction::StartIndex | IndexingAction::Retry => {
+                    self.start_indexing();
+                }
+                IndexingAction::Cancel => {
+                    self.notification.show("Indexing cancelled");
+                }
+                IndexingAction::Close | IndexingAction::None => {}
+            }
+            return;
+        }
+
         // Settings overlay intercepts all input when visible
         if self.settings.visible {
             match self.settings.handle_key(key) {
