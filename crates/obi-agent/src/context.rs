@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use anyhow::Result;
 
@@ -122,6 +123,174 @@ impl ContextBuilder {
         Self::pack_and_assemble(candidates, token_budget, graph, dual_brain, dims, &anchor_ids, max_node_tokens).await
     }
 
+    /// Build context using graph-only mode (no embedding/vector search).
+    /// Uses keyword matching on node names + BFS expansion from best matches.
+    /// Content is read directly from source files via file_path + line_range.
+    pub async fn build_graph_only(
+        query: &str,
+        token_budget: usize,
+        dual_brain: &DualBrain,
+        project_root: &Path,
+        pinned: &HashSet<NodeId>,
+        excluded: &HashSet<NodeId>,
+        max_node_tokens: usize,
+    ) -> Result<ContextWindow> {
+        let graph = dual_brain.merged_graph();
+
+        // Keyword-based anchor selection: score nodes by query term overlap
+        let query_lower = query.to_lowercase();
+        let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+
+        // Filter out very short/common query terms that match too broadly
+        let stop_words: HashSet<&str> = ["bir", "var", "ne", "bu", "da", "de", "mi", "mu",
+            "the", "a", "is", "in", "of", "to", "and", "for", "how", "what", "which",
+            "kac", "altinda", "kaç", "altında"].iter().copied().collect();
+
+        let meaningful_terms: Vec<&str> = query_terms
+            .iter()
+            .filter(|t| t.len() >= 3 && !stop_words.contains(**t))
+            .copied()
+            .collect();
+
+        let mut scored_nodes: Vec<(NodeId, f64)> = graph
+            .nodes()
+            .filter(|n| !excluded.contains(&n.id))
+            .map(|n| {
+                let name_lower = n.name.to_lowercase();
+                let mut score = 0.0_f64;
+
+                for term in &meaningful_terms {
+                    // Exact name match gets highest score
+                    if name_lower == *term {
+                        score += 5.0;
+                    } else if name_lower.contains(term) {
+                        score += 2.0;
+                    }
+                }
+
+                (n.id, score)
+            })
+            .filter(|(_, score)| *score > 0.0)
+            .collect();
+
+        // If no keyword matches, fall back to File-type nodes (project overview)
+        if scored_nodes.is_empty() {
+            let mut file_nodes: Vec<(NodeId, f64)> = graph
+                .nodes()
+                .filter(|n| !excluded.contains(&n.id) && n.node_type == NodeType::File)
+                .map(|n| {
+                    let edge_count = graph.neighbors(&n.id, 1).len();
+                    (n.id, (edge_count as f64).max(1.0))
+                })
+                .collect();
+            file_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            file_nodes.truncate(DEFAULT_TOP_K);
+            scored_nodes = file_nodes;
+        }
+
+        scored_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored_nodes.truncate(DEFAULT_TOP_K);
+
+        let anchor_ids: Vec<NodeId> = scored_nodes.iter().map(|(id, _)| *id).collect();
+        let mut candidates: HashMap<NodeId, f64> = scored_nodes.into_iter().collect();
+
+        // BFS expansion from anchors (depth 1 only in graph-only mode — keep context focused)
+        Self::expand_candidates_shallow(&anchor_ids, &mut candidates, graph, excluded);
+
+        // Force pinned nodes
+        Self::apply_pinned(pinned, excluded, &mut candidates);
+
+        // Token packing with file-based content reading
+        Self::pack_and_assemble_from_files(
+            candidates,
+            token_budget,
+            graph,
+            project_root,
+            &anchor_ids,
+            max_node_tokens,
+        )
+    }
+
+    /// Step 3-4 for graph-only mode: reads content from source files.
+    fn pack_and_assemble_from_files(
+        candidates: HashMap<NodeId, f64>,
+        token_budget: usize,
+        graph: &KnowledgeGraph,
+        project_root: &Path,
+        anchor_ids: &[NodeId],
+        max_node_tokens: usize,
+    ) -> Result<ContextWindow> {
+        let mut sorted_candidates: Vec<(NodeId, f64)> = candidates.into_iter().collect();
+        sorted_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut selected: Vec<ContextNode> = Vec::new();
+        let mut remaining = token_budget;
+        let mut naive_tokens: usize = 0;
+
+        for (node_id, score) in sorted_candidates {
+            if remaining < MIN_REMAINING_TOKENS {
+                break;
+            }
+
+            let node_meta = match graph.get_node(&node_id) {
+                Some(node) => node,
+                None => continue,
+            };
+
+            // Read content from source file
+            let content = match read_node_content(project_root, &node_meta.file_path, &node_meta.line_range) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            let (content, token_count) = if max_node_tokens > 0 {
+                let raw_tokens = estimate_tokens(&content);
+                naive_tokens += raw_tokens;
+                if raw_tokens > max_node_tokens {
+                    let truncated = truncate_to_tokens(&content, max_node_tokens);
+                    let tc = estimate_tokens(&truncated);
+                    (truncated, tc)
+                } else {
+                    (content, raw_tokens)
+                }
+            } else {
+                let tc = estimate_tokens(&content);
+                naive_tokens += tc;
+                (content, tc)
+            };
+
+            if token_count <= remaining {
+                remaining -= token_count;
+                selected.push(ContextNode {
+                    node_id,
+                    name: node_meta.name.clone(),
+                    file_path: node_meta.file_path.to_string_lossy().to_string(),
+                    line_start: node_meta.line_range.start,
+                    line_end: node_meta.line_range.end,
+                    node_type: node_meta.node_type,
+                    content,
+                    score,
+                    token_count,
+                });
+            }
+        }
+
+        selected.sort_by_key(|n| type_priority(n.node_type));
+
+        let in_context_ids: Vec<NodeId> = selected.iter().map(|n| n.node_id).collect();
+        let total_tokens = token_budget - remaining;
+        let formatted = format_context(&selected, graph);
+
+        Ok(ContextWindow {
+            nodes: selected,
+            anchor_ids: anchor_ids.to_vec(),
+            in_context_ids,
+            total_tokens,
+            formatted,
+            naive_tokens,
+        })
+    }
+
     /// Original single-brain build method (backward compatible).
     pub async fn build(
         query: &str,
@@ -241,6 +410,30 @@ impl ContextBuilder {
                 let decay = DEPTH_DECAY[depth.min(DEPTH_DECAY.len() - 1)];
                 let score = anchor_score * edge.weight * decay;
 
+                let entry = candidates.entry(neighbor_id).or_insert(0.0);
+                if score > *entry {
+                    *entry = score;
+                }
+            }
+        }
+    }
+
+    /// Shallow BFS expansion (depth 1 only) — used by graph-only mode to keep context focused.
+    fn expand_candidates_shallow(
+        anchor_ids: &[NodeId],
+        candidates: &mut HashMap<NodeId, f64>,
+        graph: &KnowledgeGraph,
+        excluded: &HashSet<NodeId>,
+    ) {
+        for anchor_id in anchor_ids {
+            let anchor_score = candidates.get(anchor_id).copied().unwrap_or(0.0);
+            let neighbors = graph.neighbors(anchor_id, 1);
+
+            for (neighbor_id, edge, depth) in neighbors {
+                if excluded.contains(&neighbor_id) || depth > 1 {
+                    continue;
+                }
+                let score = anchor_score * edge.weight * DEPTH_DECAY[1];
                 let entry = candidates.entry(neighbor_id).or_insert(0.0);
                 if score > *entry {
                     *entry = score;
@@ -458,6 +651,23 @@ fn collect_relationships(
         parts.push(format!("imports: {}", imports.join(", ")));
     }
     parts.join(", ")
+}
+
+/// Read node content from source file using file_path and line_range.
+fn read_node_content(project_root: &Path, file_path: &Path, line_range: &std::ops::Range<usize>) -> Option<String> {
+    let full_path = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        project_root.join(file_path)
+    };
+    let content = std::fs::read_to_string(&full_path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = line_range.start.saturating_sub(1); // 1-based to 0-based
+    let end = line_range.end.min(lines.len());
+    if start >= lines.len() {
+        return None;
+    }
+    Some(lines[start..end].join("\n"))
 }
 
 /// Human-readable type label for context headers.

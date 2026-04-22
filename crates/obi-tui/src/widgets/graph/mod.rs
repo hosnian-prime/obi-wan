@@ -92,9 +92,11 @@ impl GraphWidget {
         self.loaded = true;
     }
 
-    /// Update the graph (e.g., after indexer re-index).
+    /// Update the graph (e.g., after indexer re-index). Auto fits to show all nodes.
     pub fn update_graph(&mut self, graph: KnowledgeGraph) {
         self.load_graph(graph);
+        // Reset snapshot tick so auto fit-all triggers during next renders
+        self.snapshot.tick = 0;
     }
 
     /// Pull latest snapshot from layout thread and update viewport.

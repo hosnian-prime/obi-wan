@@ -12,6 +12,7 @@ pub enum AppEvent {
     // TUI
     Key(KeyEvent),
     Mouse(MouseEvent),
+    Paste(String),
     Resize(u16, u16),
 
     // Indexer (Phase 2)

@@ -467,16 +467,29 @@ impl Agent {
 
         let context_budget = context_budget.max(1000);
 
-        ContextBuilder::build_dual(
-            query,
-            context_budget,
-            &self.dual_brain,
-            &self.router,
-            &self.pinned,
-            &self.excluded,
-            self.max_node_tokens,
-        )
-        .await
+        if self.dual_brain.embedding_enabled() {
+            ContextBuilder::build_dual(
+                query,
+                context_budget,
+                &self.dual_brain,
+                &self.router,
+                &self.pinned,
+                &self.excluded,
+                self.max_node_tokens,
+            )
+            .await
+        } else {
+            ContextBuilder::build_graph_only(
+                query,
+                context_budget,
+                &self.dual_brain,
+                &self.project_root,
+                &self.pinned,
+                &self.excluded,
+                self.max_node_tokens,
+            )
+            .await
+        }
     }
 }
 
@@ -495,10 +508,15 @@ pub fn spawn_agent(
         let mut agent = Agent::new(project_root, knowledge_graph);
 
         // Send model info to TUI on startup
+        let embed_model = if agent.dual_brain.embedding_enabled() {
+            agent.router.embedding_model().to_string()
+        } else {
+            "off".to_string()
+        };
         let _ = event_tx.send(AgentEvent::ModelInfo {
             provider: agent.router.completion_name().to_string(),
             chat_model: agent.router.completion_model().to_string(),
-            embed_model: agent.router.embedding_model().to_string(),
+            embed_model,
         });
 
         while let Some(cmd) = cmd_rx.recv().await {
@@ -531,10 +549,15 @@ pub fn spawn_agent(
                 }
                 AgentCommand::ReloadConfig => {
                     agent.reload_config();
+                    let reload_embed = if agent.dual_brain.embedding_enabled() {
+                        agent.router.embedding_model().to_string()
+                    } else {
+                        "off".to_string()
+                    };
                     let _ = event_tx.send(AgentEvent::ModelInfo {
                         provider: agent.router.completion_name().to_string(),
                         chat_model: agent.router.completion_model().to_string(),
-                        embed_model: agent.router.embedding_model().to_string(),
+                        embed_model: reload_embed,
                     });
                 }
             }

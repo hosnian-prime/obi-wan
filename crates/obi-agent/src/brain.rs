@@ -39,6 +39,8 @@ pub struct DualBrain {
     project: Option<BrainInstance>,
     global: Option<BrainInstance>,
     config: BrainConfig,
+    /// Whether embedding/vector search is enabled.
+    embedding_enabled: bool,
     /// Merged graph (project + global) for context expansion.
     merged_graph: KnowledgeGraph,
     /// Cached VectorStore for project brain (opened lazily on first use).
@@ -49,8 +51,10 @@ pub struct DualBrain {
 
 impl DualBrain {
     /// Load both brains based on config. Non-fatal: if a brain doesn't exist, it's skipped.
+    /// When `embedding_enabled` is false, only `graph.bin` is required (no `db`).
     pub fn load(project_root: &Path, config: &ObiConfig) -> Self {
         let brain_config = &config.brain;
+        let embedding_enabled = brain_config.embedding_enabled;
         let mut merged_graph = KnowledgeGraph::new();
 
         // Load project brain
@@ -59,7 +63,13 @@ impl DualBrain {
             let graph_path = obi_dir.join("graph.bin");
             let db_path = obi_dir.join("db");
 
-            if graph_path.exists() && db_path.exists() {
+            let can_load = if embedding_enabled {
+                graph_path.exists() && db_path.exists()
+            } else {
+                graph_path.exists()
+            };
+
+            if can_load {
                 match KnowledgeGraph::load_from_disk(&graph_path) {
                     Ok(graph) => {
                         merged_graph.merge(&graph);
@@ -84,7 +94,13 @@ impl DualBrain {
             let graph_path = obi_dir.join("graph.bin");
             let db_path = obi_dir.join("db");
 
-            if graph_path.exists() && db_path.exists() {
+            let can_load = if embedding_enabled {
+                graph_path.exists() && db_path.exists()
+            } else {
+                graph_path.exists()
+            };
+
+            if can_load {
                 match KnowledgeGraph::load_from_disk(&graph_path) {
                     Ok(graph) => {
                         merged_graph.merge(&graph);
@@ -107,6 +123,7 @@ impl DualBrain {
             project,
             global,
             config: brain_config.clone(),
+            embedding_enabled,
             merged_graph,
             project_store: OnceCell::new(),
             global_store: OnceCell::new(),
@@ -126,6 +143,11 @@ impl DualBrain {
     /// Whether any brain is available.
     pub fn has_any_brain(&self) -> bool {
         self.project.is_some() || self.global.is_some()
+    }
+
+    /// Whether embedding/vector search is enabled.
+    pub fn embedding_enabled(&self) -> bool {
+        self.embedding_enabled
     }
 
     /// Get or lazily open the cached project VectorStore.

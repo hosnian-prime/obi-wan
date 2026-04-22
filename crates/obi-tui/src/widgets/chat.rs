@@ -17,7 +17,6 @@ const CLR_TOML_SECTION: Color = Color::Rgb(180, 140, 255);
 const CLR_TOML_KEY: Color = Color::Rgb(140, 200, 255);
 const CLR_TOML_VALUE: Color = Color::Rgb(100, 170, 130);
 
-const CLR_USER_MSG: Color = Color::White;
 const CLR_ASSISTANT_LABEL: Color = Color::Rgb(180, 140, 255);
 const CLR_ASSISTANT_MSG: Color = Color::Rgb(160, 210, 160);
 const CLR_SYSTEM_MSG: Color = Color::Rgb(140, 140, 160);
@@ -74,8 +73,13 @@ struct ToolConfirmationInfo {
 // ─── Widget ─────────────────────────────────────────────────────────
 
 /// AI chat panel with agent integration — streaming, tool confirmation, context display.
+/// Threshold: pastes with more lines than this are shown in compact form.
+const PASTE_COMPACT_THRESHOLD: usize = 3;
+
 pub struct ChatWidget {
     input: String,
+    /// Full pasted text stored separately — shown compactly in input, sent fully on Enter.
+    pasted_text: Option<String>,
     messages: Vec<ChatMessage>,
     building_context: bool,
     streaming: bool,
@@ -101,6 +105,7 @@ impl ChatWidget {
     pub fn new() -> Self {
         Self {
             input: String::new(),
+            pasted_text: None,
             messages: Vec::new(),
             building_context: false,
             streaming: false,
@@ -136,11 +141,21 @@ impl ChatWidget {
 
         match key.code {
             KeyCode::Char(c) => {
+                // Any typing clears the pasted text — user is composing fresh input
+                if self.pasted_text.is_some() {
+                    self.pasted_text = None;
+                }
                 self.input.push(c);
                 None
             }
             KeyCode::Backspace => {
-                self.input.pop();
+                if self.pasted_text.is_some() {
+                    // Backspace on pasted text clears the whole paste
+                    self.pasted_text = None;
+                    self.input.clear();
+                } else {
+                    self.input.pop();
+                }
                 None
             }
             KeyCode::Enter => self.submit_input(),
@@ -148,8 +163,33 @@ impl ChatWidget {
         }
     }
 
+    /// Handle a bracketed paste event.
+    pub fn handle_paste(&mut self, text: String) {
+        if self.streaming || self.building_context {
+            return;
+        }
+        let line_count = text.lines().count();
+        if line_count > PASTE_COMPACT_THRESHOLD {
+            // Store full text, show compact preview in input
+            let first_line = text.lines().next().unwrap_or("").chars().take(30).collect::<String>();
+            let preview = if first_line.len() < text.lines().next().unwrap_or("").len() {
+                format!("{}...", first_line)
+            } else {
+                first_line
+            };
+            self.input = format!("[Pasted: {} lines] {}", line_count, preview);
+            self.pasted_text = Some(text);
+        } else {
+            // Short paste — inline it directly (replace newlines with spaces)
+            let inline = text.replace('\n', " ");
+            self.input.push_str(&inline);
+        }
+    }
+
     fn submit_input(&mut self) -> Option<String> {
-        if self.input.is_empty() || self.streaming || self.building_context {
+        let has_paste = self.pasted_text.is_some();
+        let is_empty = self.input.is_empty() && !has_paste;
+        if is_empty || self.streaming || self.building_context {
             return None;
         }
 
@@ -158,7 +198,14 @@ impl ChatWidget {
             return None;
         }
 
-        let text = std::mem::take(&mut self.input);
+        // If we have pasted text, send the full content; otherwise send input
+        let text = if let Some(pasted) = self.pasted_text.take() {
+            self.input.clear();
+            pasted
+        } else {
+            std::mem::take(&mut self.input)
+        };
+
         self.messages.push(ChatMessage {
             role: Role::User,
             content: text.clone(),
@@ -171,8 +218,9 @@ impl ChatWidget {
     // ─── Scroll ─────────────────────────────────────────────────
 
     pub fn scroll_up(&mut self, lines: usize) {
-        let max = self.messages.len();
-        self.scroll_offset = (self.scroll_offset + lines).min(max);
+        // Max scroll is capped at a reasonable limit (total rendered lines)
+        // Exact cap is enforced during render, so just allow generous scrolling here
+        self.scroll_offset = self.scroll_offset.saturating_add(lines);
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
@@ -208,6 +256,7 @@ impl ChatWidget {
                 content: final_text,
             });
         }
+        self.scroll_offset = 0; // auto-scroll to bottom
     }
 
     pub fn finish_streaming_with_error(&mut self) {
@@ -267,6 +316,7 @@ impl ChatWidget {
             _ => Role::System,
         };
         self.messages.push(ChatMessage { role, content });
+        self.scroll_offset = 0; // auto-scroll to bottom on new message
     }
 
     /// Whether the chat needs periodic redraws (spinner animation active).
@@ -443,14 +493,21 @@ impl ChatWidget {
 
     fn render_header(&self, lines: &mut Vec<Line<'_>>, header_lines: &mut u16) {
         if let Some(ref mi) = self.model_info {
-            lines.push(Line::from(vec![
+            let mut header_spans = vec![
                 Span::styled(" ", Style::default()),
                 Span::styled(mi.provider.clone(), Style::default().fg(CLR_PROVIDER).add_modifier(Modifier::BOLD)),
                 Span::styled("/", Style::default().fg(CLR_DIM)),
                 Span::styled(mi.chat_model.clone(), Style::default().fg(CLR_MODEL)),
                 Span::styled("  embed:", Style::default().fg(CLR_DIM)),
                 Span::styled(mi.embed_model.clone(), Style::default().fg(CLR_EMBED)),
-            ]));
+            ];
+            if mi.embed_model == "off" {
+                header_spans.push(Span::styled(
+                    " [graph-only, no semantic search — higher token cost]",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            lines.push(Line::from(header_spans));
         } else {
             lines.push(Line::from(vec![
                 Span::styled(" \u{26a0} ", Style::default().fg(Color::Yellow)),
@@ -480,45 +537,42 @@ impl ChatWidget {
         }
     }
 
+    /// Render all messages into styled lines, then apply line-based scroll.
     fn render_messages(&self, lines: &mut Vec<Line<'_>>, max_visible: usize, width: u16) {
-        let end = self.messages.len().saturating_sub(self.scroll_offset);
-        let start = end.saturating_sub(max_visible);
-        let visible = &self.messages[start..end];
         let w = width.saturating_sub(2) as usize;
 
-        for (i, msg) in visible.iter().enumerate() {
-            // Separator between message blocks
-            let prev_role = if i > 0 { Some(visible[i - 1].role) } else { None };
-            let needs_separator = prev_role.is_some() && prev_role != Some(msg.role);
+        // Step 1: Build ALL message lines
+        let mut all_lines: Vec<Line> = Vec::new();
+        let mut prev_role: Option<Role> = None;
 
+        for msg in &self.messages {
+            let needs_separator = prev_role.is_some() && prev_role != Some(msg.role);
             if needs_separator {
-                lines.push(Line::from(""));
+                all_lines.push(Line::from(""));
             }
 
             match msg.role {
                 Role::User => {
+                    let user_style = Style::default().fg(Color::Black).bg(Color::White);
                     let wrapped = wrap_text(&msg.content, w.saturating_sub(4));
                     for (j, line) in wrapped.iter().enumerate() {
                         let prefix = if j == 0 { " \u{276f} " } else { "   " };
-                        lines.push(Line::from(Span::styled(
-                            format!("{prefix}{line}"),
-                            Style::default().fg(CLR_USER_MSG),
-                        )));
+                        // Pad to full width so background fills the line
+                        let text = format!("{prefix}{line}");
+                        let padded = format!("{:<width$}", text, width = w);
+                        all_lines.push(Line::from(Span::styled(padded, user_style)));
                     }
                 }
                 Role::Assistant => {
-                    // Role header on first assistant message in a block
                     let is_first_in_block = prev_role != Some(Role::Assistant);
                     if is_first_in_block {
-                        lines.push(Line::from(Span::styled(
+                        all_lines.push(Line::from(Span::styled(
                             " \u{25cf} obi-wan",
                             Style::default().fg(CLR_ASSISTANT_LABEL).add_modifier(Modifier::BOLD),
                         )));
                     }
-
-                    // Wrap content lines with indent
                     for line in wrap_text(&msg.content, w.saturating_sub(3)) {
-                        lines.push(Line::from(Span::styled(
+                        all_lines.push(Line::from(Span::styled(
                             format!("   {line}"),
                             Style::default().fg(CLR_ASSISTANT_MSG),
                         )));
@@ -526,14 +580,23 @@ impl ChatWidget {
                 }
                 Role::System => {
                     for line in wrap_text(&msg.content, w.saturating_sub(3)) {
-                        lines.push(Line::from(Span::styled(
+                        all_lines.push(Line::from(Span::styled(
                             format!("   {line}"),
                             Style::default().fg(CLR_SYSTEM_MSG).add_modifier(Modifier::ITALIC),
                         )));
                     }
                 }
             }
+            prev_role = Some(msg.role);
         }
+
+        // Step 2: Line-based scroll from bottom
+        // scroll_offset=0 means show the latest lines (bottom), >0 means scroll up
+        let total = all_lines.len();
+        let end = total.saturating_sub(self.scroll_offset);
+        let start = end.saturating_sub(max_visible);
+
+        lines.extend(all_lines.into_iter().skip(start).take(end - start));
     }
 
     /// Estimate how many lines the thinking indicator will consume.
@@ -657,9 +720,18 @@ impl ChatWidget {
             lines.push(Line::from(spans));
         } else {
             let prefix = Span::styled("\u{276f} ", Style::default().fg(Color::Yellow));
-            let text = Span::styled(self.input.clone(), Style::default().fg(Color::White));
-            let cursor = Span::styled("\u{2588}", Style::default().fg(Color::DarkGray));
-            lines.push(Line::from(vec![prefix, text, cursor]));
+            if self.pasted_text.is_some() {
+                // Compact paste preview with distinct styling
+                let text = Span::styled(
+                    self.input.clone(),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+                );
+                lines.push(Line::from(vec![prefix, text]));
+            } else {
+                let text = Span::styled(self.input.clone(), Style::default().fg(Color::White));
+                let cursor = Span::styled("\u{2588}", Style::default().fg(Color::DarkGray));
+                lines.push(Line::from(vec![prefix, text, cursor]));
+            }
         }
     }
 
@@ -765,30 +837,54 @@ fn lines_to_plain(lines: &[Line<'_>]) -> Vec<String> {
         .collect()
 }
 
-/// Word-aware text wrapping.
+/// Snap a byte index to the nearest char boundary at or before `pos`.
+fn floor_char_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() {
+        return s.len();
+    }
+    let mut i = pos;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Word-aware text wrapping (UTF-8 safe, newline-aware).
 fn wrap_text(text: &str, max_width: usize) -> Vec<&str> {
-    if max_width == 0 || text.len() <= max_width {
+    if max_width == 0 {
         return vec![text];
     }
 
     let mut result = Vec::new();
-    let mut start = 0;
 
-    while start < text.len() {
-        let end = (start + max_width).min(text.len());
-        if end == text.len() {
-            result.push(&text[start..]);
-            break;
+    // First split on actual newlines, then wrap each line
+    for line in text.split('\n') {
+        if line.is_empty() {
+            result.push("");
+            continue;
+        }
+        if line.len() <= max_width {
+            result.push(line);
+            continue;
         }
 
-        // Find last space within the line to break at word boundary
-        let chunk = &text[start..end];
-        if let Some(last_space) = chunk.rfind(' ') {
-            result.push(&text[start..start + last_space]);
-            start += last_space + 1;
-        } else {
-            result.push(&text[start..end]);
-            start = end;
+        // Wrap this single line
+        let mut start = 0;
+        while start < line.len() {
+            let end = floor_char_boundary(line, (start + max_width).min(line.len()));
+            if end == line.len() {
+                result.push(&line[start..]);
+                break;
+            }
+
+            let chunk = &line[start..end];
+            if let Some(last_space) = chunk.rfind(' ') {
+                result.push(&line[start..start + last_space]);
+                start += last_space + 1;
+            } else {
+                result.push(&line[start..end]);
+                start = end;
+            }
         }
     }
 

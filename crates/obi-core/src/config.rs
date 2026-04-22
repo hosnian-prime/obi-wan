@@ -96,6 +96,7 @@ pub struct ZaiConfig {
 pub struct BrainConfig {
     pub project_enabled: bool,
     pub global_enabled: bool,
+    pub embedding_enabled: bool,
     pub project_boost: f64,
     pub code_sources: Vec<PathBuf>,
     pub note_sources: Vec<PathBuf>,
@@ -211,6 +212,7 @@ impl Default for BrainConfig {
         Self {
             project_enabled: true,
             global_enabled: true,
+            embedding_enabled: false,
             project_boost: 1.5,
             code_sources: vec![PathBuf::from("src/"), PathBuf::from("lib/")],
             note_sources: vec![PathBuf::from(".obi/notes/")],
@@ -256,6 +258,9 @@ impl ObiConfig {
         }
         if over.brain.global_enabled != db.global_enabled {
             self.brain.global_enabled = over.brain.global_enabled;
+        }
+        if over.brain.embedding_enabled != db.embedding_enabled {
+            self.brain.embedding_enabled = over.brain.embedding_enabled;
         }
         if (over.brain.project_boost - db.project_boost).abs() > f64::EPSILON {
             self.brain.project_boost = over.brain.project_boost;

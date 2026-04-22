@@ -59,6 +59,7 @@ async fn run_tui() -> Result<()> {
             std::io::stdout(),
             crossterm::terminal::LeaveAlternateScreen,
             crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
             crossterm::cursor::Show
         );
         // Write crash log to .obi/crash.log for debugging
@@ -69,10 +70,11 @@ async fn run_tui() -> Result<()> {
         original_hook(info);
     }));
 
-    // Enable mouse capture alongside raw mode
+    // Enable mouse capture and bracketed paste alongside raw mode
     crossterm::execute!(
         std::io::stdout(),
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste
     )?;
     let terminal = ratatui::init();
     let mut app = App::new(pr2.clone());
@@ -80,7 +82,8 @@ async fn run_tui() -> Result<()> {
     ratatui::restore();
     crossterm::execute!(
         std::io::stdout(),
-        crossterm::event::DisableMouseCapture
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
     )?;
 
     if let Err(ref e) = result {
@@ -109,6 +112,9 @@ async fn cmd_index() -> Result<()> {
 
     let graph_path = obi_dir.join("graph.bin");
     let db_path = obi_dir.join("db");
+
+    let obi_config = obi_core::config::ObiConfig::load(&project_root);
+    let embedding_enabled = obi_config.brain.embedding_enabled;
 
     println!("Indexing {}...", project_root.display());
 
@@ -182,77 +188,77 @@ async fn cmd_index() -> Result<()> {
         println!("  First index: embedding all {} nodes", nodes_to_embed.len());
     }
 
-    // --- Step 3: Embed via Ollama ---
-    let provider = obi_llm::ollama::OllamaEmbedding::default_local();
-    let embeddings = match obi_indexer::embedder::embed_nodes(&provider, &nodes_to_embed).await {
-        Ok(emb) => {
-            println!("  Embedded {} nodes via Ollama", emb.len());
-            emb
-        }
-        Err(e) => {
-            eprintln!(
-                "  Warning: embedding failed ({}). Skipping LanceDB + semantic edges.",
-                e
-            );
-            eprintln!("  Tip: make sure Ollama is running (`ollama serve`)");
-            HashMap::new()
-        }
-    };
-
-    // --- Step 4: Store in LanceDB ---
-    if !embeddings.is_empty() || !removed_ids.is_empty() {
-        match obi_indexer::store::VectorStore::open(&db_path, provider.dimensions()).await {
-            Ok(store) => {
-                // Delete removed nodes
-                if !removed_ids.is_empty() {
-                    if let Err(e) = store.delete(&removed_ids).await {
-                        eprintln!("  Warning: failed to delete removed nodes from LanceDB: {}", e);
-                    }
-                }
-
-                // Upsert new/modified nodes
-                if !embeddings.is_empty() {
-                    let records: Vec<obi_indexer::store::NodeRecord> = embeddings
-                        .iter()
-                        .filter_map(|(id, embedding)| {
-                            let node = result.graph.get_node(id)?;
-                            let content = result.node_contents.get(id)?;
-                            Some(obi_indexer::store::NodeRecord {
-                                id: id.to_string(),
-                                name: node.name.clone(),
-                                content: content.clone(),
-                                file_path: node.file_path.to_string_lossy().to_string(),
-                                node_type: format!("{:?}", node.node_type),
-                                embedding: embedding.clone(),
-                            })
-                        })
-                        .collect();
-
-                    match store.upsert(&records).await {
-                        Ok(()) => println!("  Stored {} records in LanceDB", records.len()),
-                        Err(e) => eprintln!("  Warning: LanceDB upsert failed: {}", e),
-                    }
-                }
+    if embedding_enabled {
+        // --- Step 3: Embed via Ollama ---
+        let provider = obi_llm::ollama::OllamaEmbedding::default_local();
+        let embeddings = match obi_indexer::embedder::embed_nodes(&provider, &nodes_to_embed).await {
+            Ok(emb) => {
+                println!("  Embedded {} nodes via Ollama", emb.len());
+                emb
             }
             Err(e) => {
-                eprintln!("  Warning: failed to open LanceDB: {}", e);
+                eprintln!(
+                    "  Warning: embedding failed ({}). Skipping LanceDB + semantic edges.",
+                    e
+                );
+                eprintln!("  Tip: make sure Ollama is running (`ollama serve`)");
+                HashMap::new()
+            }
+        };
+
+        // --- Step 4: Store in LanceDB ---
+        if !embeddings.is_empty() || !removed_ids.is_empty() {
+            match obi_indexer::store::VectorStore::open(&db_path, provider.dimensions()).await {
+                Ok(store) => {
+                    if !removed_ids.is_empty() {
+                        if let Err(e) = store.delete(&removed_ids).await {
+                            eprintln!("  Warning: failed to delete removed nodes from LanceDB: {}", e);
+                        }
+                    }
+                    if !embeddings.is_empty() {
+                        let records: Vec<obi_indexer::store::NodeRecord> = embeddings
+                            .iter()
+                            .filter_map(|(id, embedding)| {
+                                let node = result.graph.get_node(id)?;
+                                let content = result.node_contents.get(id)?;
+                                Some(obi_indexer::store::NodeRecord {
+                                    id: id.to_string(),
+                                    name: node.name.clone(),
+                                    content: content.clone(),
+                                    file_path: node.file_path.to_string_lossy().to_string(),
+                                    node_type: format!("{:?}", node.node_type),
+                                    embedding: embedding.clone(),
+                                })
+                            })
+                            .collect();
+                        match store.upsert(&records).await {
+                            Ok(()) => println!("  Stored {} records in LanceDB", records.len()),
+                            Err(e) => eprintln!("  Warning: LanceDB upsert failed: {}", e),
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Warning: failed to open LanceDB: {}", e);
+                }
             }
         }
-    }
 
-    // --- Step 5: Resolve semantic edges ---
-    if !embeddings.is_empty() {
-        let node_ids: Vec<obi_core::node::NodeId> =
-            result.graph.all_nodes().keys().copied().collect();
-        let semantic_edges =
-            obi_indexer::edges::resolve_semantic_edges(&node_ids, &embeddings, 0.85);
-        let semantic_count = semantic_edges.len();
-        for edge in semantic_edges {
-            result.graph.add_edge(edge);
+        // --- Step 5: Resolve semantic edges ---
+        if !embeddings.is_empty() {
+            let node_ids: Vec<obi_core::node::NodeId> =
+                result.graph.all_nodes().keys().copied().collect();
+            let semantic_edges =
+                obi_indexer::edges::resolve_semantic_edges(&node_ids, &embeddings, 0.85);
+            let semantic_count = semantic_edges.len();
+            for edge in semantic_edges {
+                result.graph.add_edge(edge);
+            }
+            if semantic_count > 0 {
+                println!("  Added {} semantic edges (cosine > 0.85)", semantic_count);
+            }
         }
-        if semantic_count > 0 {
-            println!("  Added {} semantic edges (cosine > 0.85)", semantic_count);
-        }
+    } else {
+        println!("  Embedding disabled — graph-only mode");
     }
 
     // --- Step 6: Save graph ---
@@ -462,6 +468,10 @@ async fn run_index_inner(
     let graph_path = obi_dir.join("graph.bin");
     let db_path = obi_dir.join("db");
 
+    // Load config to check embedding_enabled
+    let obi_config = obi_core::config::ObiConfig::load(&project_root);
+    let embedding_enabled = obi_config.brain.embedding_enabled;
+
     let _ = tx.send(event::AppEvent::IndexingStatus("Parsing files...".into()));
 
     // Step 1: Parse
@@ -520,110 +530,116 @@ async fn run_index_inner(
         nodes_to_embed = result.node_contents.clone();
     }
 
-    let total = nodes_to_embed.len();
-    let _ = tx.send(event::AppEvent::IndexingProgress { done: 0, total });
-    let _ = tx.send(event::AppEvent::IndexingStatus("Embedding nodes...".into()));
+    if embedding_enabled {
+        let total = nodes_to_embed.len();
+        let _ = tx.send(event::AppEvent::IndexingProgress { done: 0, total });
+        let _ = tx.send(event::AppEvent::IndexingStatus("Embedding nodes...".into()));
 
-    if cancelled.load(Ordering::Relaxed) {
-        anyhow::bail!("Cancelled");
-    }
+        if cancelled.load(Ordering::Relaxed) {
+            anyhow::bail!("Cancelled");
+        }
 
-    // Step 3: Embed with progress
-    let provider = obi_llm::ollama::OllamaEmbedding::default_local();
-    let mut embeddings = HashMap::new();
+        // Step 3: Embed with progress
+        let provider = obi_llm::ollama::OllamaEmbedding::default_local();
+        let mut embeddings = HashMap::new();
 
-    if !nodes_to_embed.is_empty() {
-        let truncated: Vec<(obi_core::node::NodeId, String)> = nodes_to_embed
-            .iter()
-            .map(|(id, content)| {
-                let text = if content.len() > 30_000 {
-                    content[..30_000].to_string()
-                } else {
-                    content.clone()
-                };
-                (*id, text)
-            })
-            .collect();
+        if !nodes_to_embed.is_empty() {
+            let truncated: Vec<(obi_core::node::NodeId, String)> = nodes_to_embed
+                .iter()
+                .map(|(id, content)| {
+                    let text = if content.len() > 30_000 {
+                        content[..30_000].to_string()
+                    } else {
+                        content.clone()
+                    };
+                    (*id, text)
+                })
+                .collect();
 
-        let batch_size = provider.max_batch_size();
-        let mut done = 0_usize;
+            let batch_size = provider.max_batch_size();
+            let mut done = 0_usize;
 
-        for chunk in truncated.chunks(batch_size) {
-            if cancelled.load(Ordering::Relaxed) {
-                anyhow::bail!("Cancelled");
-            }
-
-            let texts: Vec<&str> = chunk.iter().map(|(_, c)| c.as_str()).collect();
-            let ids: Vec<obi_core::node::NodeId> = chunk.iter().map(|(id, _)| *id).collect();
-
-            match provider.embed(&texts).await {
-                Ok(vecs) => {
-                    for (id, vec) in ids.into_iter().zip(vecs.into_iter()) {
-                        embeddings.insert(id, vec);
-                    }
+            for chunk in truncated.chunks(batch_size) {
+                if cancelled.load(Ordering::Relaxed) {
+                    anyhow::bail!("Cancelled");
                 }
-                Err(_) => {
-                    for (id, content) in chunk {
-                        match provider.embed(&[content.as_str()]).await {
-                            Ok(vecs) if !vecs.is_empty() => {
-                                embeddings.insert(*id, vecs.into_iter().next().unwrap());
+
+                let texts: Vec<&str> = chunk.iter().map(|(_, c)| c.as_str()).collect();
+                let ids: Vec<obi_core::node::NodeId> = chunk.iter().map(|(id, _)| *id).collect();
+
+                match provider.embed(&texts).await {
+                    Ok(vecs) => {
+                        for (id, vec) in ids.into_iter().zip(vecs.into_iter()) {
+                            embeddings.insert(id, vec);
+                        }
+                    }
+                    Err(_) => {
+                        for (id, content) in chunk {
+                            match provider.embed(&[content.as_str()]).await {
+                                Ok(vecs) if !vecs.is_empty() => {
+                                    embeddings.insert(*id, vecs.into_iter().next().unwrap());
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
+
+                done += chunk.len();
+                let _ = tx.send(event::AppEvent::IndexingProgress { done, total });
             }
-
-            done += chunk.len();
-            let _ = tx.send(event::AppEvent::IndexingProgress { done, total });
         }
-    }
 
-    let _ = tx.send(event::AppEvent::IndexingStatus("Storing in database...".into()));
+        let _ = tx.send(event::AppEvent::IndexingStatus("Storing in database...".into()));
 
-    // Step 4: Store in LanceDB
-    if !embeddings.is_empty() || !removed_ids.is_empty() {
-        match obi_indexer::store::VectorStore::open(&db_path, provider.dimensions()).await {
-            Ok(store) => {
-                if !removed_ids.is_empty() {
-                    let _ = store.delete(&removed_ids).await;
-                }
-                if !embeddings.is_empty() {
-                    let records: Vec<obi_indexer::store::NodeRecord> = embeddings
-                        .iter()
-                        .filter_map(|(id, embedding)| {
-                            let node = result.graph.get_node(id)?;
-                            let content = result.node_contents.get(id)?;
-                            Some(obi_indexer::store::NodeRecord {
-                                id: id.to_string(),
-                                name: node.name.clone(),
-                                content: content.clone(),
-                                file_path: node.file_path.to_string_lossy().to_string(),
-                                node_type: format!("{:?}", node.node_type),
-                                embedding: embedding.clone(),
+        // Step 4: Store in LanceDB
+        if !embeddings.is_empty() || !removed_ids.is_empty() {
+            match obi_indexer::store::VectorStore::open(&db_path, provider.dimensions()).await {
+                Ok(store) => {
+                    if !removed_ids.is_empty() {
+                        let _ = store.delete(&removed_ids).await;
+                    }
+                    if !embeddings.is_empty() {
+                        let records: Vec<obi_indexer::store::NodeRecord> = embeddings
+                            .iter()
+                            .filter_map(|(id, embedding)| {
+                                let node = result.graph.get_node(id)?;
+                                let content = result.node_contents.get(id)?;
+                                Some(obi_indexer::store::NodeRecord {
+                                    id: id.to_string(),
+                                    name: node.name.clone(),
+                                    content: content.clone(),
+                                    file_path: node.file_path.to_string_lossy().to_string(),
+                                    node_type: format!("{:?}", node.node_type),
+                                    embedding: embedding.clone(),
+                                })
                             })
-                        })
-                        .collect();
-                    store.upsert(&records).await?;
+                            .collect();
+                        store.upsert(&records).await?;
+                    }
+                }
+                Err(e) => {
+                    anyhow::bail!("Failed to open LanceDB: {}", e);
                 }
             }
-            Err(e) => {
-                anyhow::bail!("Failed to open LanceDB: {}", e);
+        }
+
+        let _ = tx.send(event::AppEvent::IndexingStatus("Resolving semantic edges...".into()));
+
+        // Step 5: Semantic edges
+        if !embeddings.is_empty() {
+            let node_ids: Vec<obi_core::node::NodeId> =
+                result.graph.all_nodes().keys().copied().collect();
+            let semantic_edges =
+                obi_indexer::edges::resolve_semantic_edges(&node_ids, &embeddings, 0.85);
+            for edge in semantic_edges {
+                result.graph.add_edge(edge);
             }
         }
-    }
-
-    let _ = tx.send(event::AppEvent::IndexingStatus("Resolving semantic edges...".into()));
-
-    // Step 5: Semantic edges
-    if !embeddings.is_empty() {
-        let node_ids: Vec<obi_core::node::NodeId> =
-            result.graph.all_nodes().keys().copied().collect();
-        let semantic_edges =
-            obi_indexer::edges::resolve_semantic_edges(&node_ids, &embeddings, 0.85);
-        for edge in semantic_edges {
-            result.graph.add_edge(edge);
-        }
+    } else {
+        let _ = tx.send(event::AppEvent::IndexingStatus("Graph-only mode (embedding disabled)".into()));
+        let total = result.graph.node_count();
+        let _ = tx.send(event::AppEvent::IndexingProgress { done: total, total });
     }
 
     // Step 6: Save graph

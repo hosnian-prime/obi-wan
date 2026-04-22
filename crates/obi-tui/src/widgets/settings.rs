@@ -55,6 +55,7 @@ enum Field {
     ZaiModel,
     ZaiMaxContext,
     ZaiBaseUrl,
+    EmbeddingEnabled,
     EmbedProvider,
     EmbedModel,
     EmbedDimensions,
@@ -74,6 +75,7 @@ impl Field {
             Field::ZaiModel => "Model",
             Field::ZaiMaxContext => "Max Context",
             Field::ZaiBaseUrl => "Base URL",
+            Field::EmbeddingEnabled => "Enabled",
             Field::EmbedProvider => "Provider",
             Field::EmbedModel => "Model",
             Field::EmbedDimensions => "Dimensions",
@@ -86,7 +88,7 @@ impl Field {
             Field::OllamaModel | Field::OllamaHost | Field::OllamaMaxContext => "  Ollama",
             Field::AnthropicApiKey | Field::AnthropicModel | Field::AnthropicMaxContext => "  Anthropic",
             Field::ZaiApiKey | Field::ZaiModel | Field::ZaiMaxContext | Field::ZaiBaseUrl => "  Z.ai",
-            Field::EmbedProvider | Field::EmbedModel | Field::EmbedDimensions => "Embedding",
+            Field::EmbeddingEnabled | Field::EmbedProvider | Field::EmbedModel | Field::EmbedDimensions => "Embedding",
         }
     }
 
@@ -94,6 +96,7 @@ impl Field {
         match self {
             Field::LlmProvider => Some(LLM_PROVIDERS),
             Field::EmbedProvider => Some(EMBED_PROVIDERS),
+            Field::EmbeddingEnabled => Some(&["true", "false"]),
             _ => None,
         }
     }
@@ -140,6 +143,7 @@ pub struct SettingsWidget {
     zai_max_context: String,
     zai_base_url: String,
     // Embedding
+    embedding_enabled: String,
     embed_provider: String,
     embed_model: String,
     embed_dimensions: String,
@@ -167,6 +171,7 @@ impl SettingsWidget {
             zai_model: String::new(),
             zai_max_context: String::new(),
             zai_base_url: String::new(),
+            embedding_enabled: String::new(),
             embed_provider: String::new(),
             embed_model: String::new(),
             embed_dimensions: String::new(),
@@ -193,6 +198,7 @@ impl SettingsWidget {
         self.zai_model = p.zai.completion.model.clone();
         self.zai_max_context = p.zai.completion.max_context.to_string();
         self.zai_base_url = p.zai.base_url.clone();
+        self.embedding_enabled = config.brain.embedding_enabled.to_string();
         self.embed_provider = p.embedding.clone();
         self.embed_model = p.ollama.embedding.model.clone();
         self.embed_dimensions = p.ollama.embedding.dimensions.to_string();
@@ -231,11 +237,14 @@ impl SettingsWidget {
                 ]);
             }
         }
-        fields.extend_from_slice(&[
-            Field::EmbedProvider,
-            Field::EmbedModel,
-            Field::EmbedDimensions,
-        ]);
+        fields.push(Field::EmbeddingEnabled);
+        if self.embedding_enabled == "true" {
+            fields.extend_from_slice(&[
+                Field::EmbedProvider,
+                Field::EmbedModel,
+                Field::EmbedDimensions,
+            ]);
+        }
         fields
     }
 
@@ -454,6 +463,9 @@ impl SettingsWidget {
                     self.selected = max;
                 }
             }
+            Field::EmbeddingEnabled => {
+                self.embedding_enabled = value;
+            }
             Field::EmbedProvider => {
                 self.embed_provider = value;
             }
@@ -511,6 +523,7 @@ impl SettingsWidget {
             Field::ZaiModel => self.zai_model = value,
             Field::ZaiMaxContext => self.zai_max_context = value,
             Field::ZaiBaseUrl => self.zai_base_url = value,
+            Field::EmbeddingEnabled => self.embedding_enabled = value,
             Field::EmbedProvider => self.embed_provider = value,
             Field::EmbedModel => self.embed_model = value,
             Field::EmbedDimensions => self.embed_dimensions = value,
@@ -530,6 +543,7 @@ impl SettingsWidget {
             Field::ZaiModel => &self.zai_model,
             Field::ZaiMaxContext => &self.zai_max_context,
             Field::ZaiBaseUrl => &self.zai_base_url,
+            Field::EmbeddingEnabled => &self.embedding_enabled,
             Field::EmbedProvider => &self.embed_provider,
             Field::EmbedModel => &self.embed_model,
             Field::EmbedDimensions => &self.embed_dimensions,
@@ -550,6 +564,7 @@ impl SettingsWidget {
     /// Build an ObiConfig from current field values.
     pub fn to_config(&self) -> ObiConfig {
         let mut config = ObiConfig::default();
+        config.brain.embedding_enabled = self.embedding_enabled == "true";
         config.providers.completion = self.llm_provider.clone();
         config.providers.embedding = self.embed_provider.clone();
         config.providers.ollama = OllamaConfig {

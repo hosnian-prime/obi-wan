@@ -224,6 +224,7 @@ impl App {
                             AppEvent::Mouse(mouse)
                         }
                         Event::Resize(w, h) => AppEvent::Resize(w, h),
+                        Event::Paste(text) => AppEvent::Paste(text),
                         _ => continue,
                     };
                     if tx.send(app_event).is_err() {
@@ -292,6 +293,11 @@ impl App {
         match event {
             AppEvent::Key(key) => self.handle_key(key),
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
+            AppEvent::Paste(text) => {
+                if self.focus == PanelFocus::Chat {
+                    self.chat.handle_paste(text);
+                }
+            }
             AppEvent::Quit => self.running = false,
             AppEvent::IndexingProgress { done, total } => {
                 self.indexing.update_progress(done, total);
