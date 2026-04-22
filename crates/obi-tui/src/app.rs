@@ -777,7 +777,32 @@ impl App {
                         self.chat.start_selection(rel_row, rel_col);
                         self.text_selecting = true;
                     }
-                    None => {} // clicked on border — do nothing
+                    None => {
+                        // Check if clicked on graph tab header (border row above graph_inner)
+                        if self.show_graph
+                            && y == pb.graph_inner.y.saturating_sub(1)
+                            && x >= pb.graph_inner.x
+                            && x < pb.graph_inner.x + pb.graph_inner.width
+                        {
+                            self.focus = PanelFocus::Graph;
+                            // " Knowledge Graph | Context Nodes "
+                            // Clicking left half = KG, right half = Context
+                            let rel_x = x.saturating_sub(pb.graph_inner.x);
+                            let midpoint = pb.graph_inner.width / 2;
+                            use crate::widgets::graph::GraphTab;
+                            let new_tab = if rel_x < midpoint {
+                                GraphTab::KnowledgeGraph
+                            } else {
+                                GraphTab::ContextNodes
+                            };
+                            if self.graph.active_tab != new_tab {
+                                self.graph.active_tab = new_tab;
+                                if new_tab == GraphTab::ContextNodes {
+                                    self.graph.set_ctx_fit_pending();
+                                }
+                            }
+                        }
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {

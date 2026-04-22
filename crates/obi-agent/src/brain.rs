@@ -39,8 +39,6 @@ pub struct DualBrain {
     project: Option<BrainInstance>,
     global: Option<BrainInstance>,
     config: BrainConfig,
-    /// Whether embedding/vector search is enabled.
-    embedding_enabled: bool,
     /// Merged graph (project + global) for context expansion.
     merged_graph: KnowledgeGraph,
     /// Cached VectorStore for project brain (opened lazily on first use).
@@ -123,7 +121,6 @@ impl DualBrain {
             project,
             global,
             config: brain_config.clone(),
-            embedding_enabled,
             merged_graph,
             project_store: OnceCell::new(),
             global_store: OnceCell::new(),
@@ -145,9 +142,9 @@ impl DualBrain {
         self.project.is_some() || self.global.is_some()
     }
 
-    /// Whether embedding/vector search is enabled.
+    /// Whether embedding/vector search is enabled (reads from config).
     pub fn embedding_enabled(&self) -> bool {
-        self.embedding_enabled
+        self.config.embedding_enabled
     }
 
     /// Get or lazily open the cached project VectorStore.

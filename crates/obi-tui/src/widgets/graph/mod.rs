@@ -21,13 +21,26 @@ use self::layout_thread::LayoutThread;
 use self::snapshot::{FilterMode, GraphSnapshot, ViewMode};
 use self::viewport::Viewport;
 
+/// Tab selector for the graph panel.
+#[derive(Clone, Copy, PartialEq)]
+pub enum GraphTab {
+    KnowledgeGraph,
+    ContextNodes,
+}
+
 /// Interactive knowledge graph widget with force-directed layout,
 /// Braille rendering, and Obsidian-style navigation.
 pub struct GraphWidget {
+    /// Active tab: Knowledge Graph or Context Nodes.
+    pub active_tab: GraphTab,
     /// Background layout thread handle.
     layout_thread: Option<LayoutThread>,
-    /// Camera viewport (pan, zoom, culling).
+    /// Camera viewport for Knowledge Graph tab.
     viewport: Viewport,
+    /// Camera viewport for Context Nodes tab (independent zoom/pan).
+    ctx_viewport: Viewport,
+    /// Frame counter for Context Nodes auto fit-all (counts down to 0).
+    ctx_fit_countdown: u8,
     /// Latest snapshot from layout thread.
     snapshot: GraphSnapshot,
     /// Currently selected node.
@@ -61,8 +74,11 @@ pub struct GraphWidget {
 impl GraphWidget {
     pub fn new() -> Self {
         Self {
+            active_tab: GraphTab::KnowledgeGraph,
             layout_thread: None,
             viewport: Viewport::new(),
+            ctx_viewport: Viewport::new(),
+            ctx_fit_countdown: 0,
             snapshot: GraphSnapshot::default(),
             selected: None,
             selection_index: 0,
@@ -127,9 +143,18 @@ impl GraphWidget {
         }
     }
 
+    /// Get the active viewport (mutable) for the current tab.
+    fn active_viewport_mut(&mut self) -> &mut Viewport {
+        match self.active_tab {
+            GraphTab::KnowledgeGraph => &mut self.viewport,
+            GraphTab::ContextNodes => &mut self.ctx_viewport,
+        }
+    }
+
     /// Render the graph widget.
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         self.viewport.set_size(area.width, area.height);
+        self.ctx_viewport.set_size(area.width, area.height);
 
         if !self.loaded {
             render_placeholder(frame, area);
@@ -139,21 +164,56 @@ impl GraphWidget {
         // Pull latest layout data
         self.refresh_snapshot();
 
-        // Advance viewport animation
+        // Advance viewport animation for both
         self.viewport.tick_animation();
+        self.ctx_viewport.tick_animation();
 
         // Auto fit-all during early ticks while layout stabilizes
         if self.snapshot.tick <= 5 && !self.snapshot.positions.is_empty() {
             self.viewport.fit_all(&self.snapshot.positions, false);
         }
 
+        // Context tab: auto fit when new context arrives (retry over several frames)
+        if self.ctx_fit_countdown > 0 && !self.snapshot.positions.is_empty() {
+            let ctx_positions: std::collections::HashMap<NodeId, math::Vec2> = self
+                .snapshot
+                .node_views
+                .values()
+                .filter(|nv| FilterMode::InContextOnly.matches(nv))
+                .filter_map(|nv| {
+                    self.snapshot.positions.get(&nv.id).map(|pos| (nv.id, *pos))
+                })
+                .collect();
+            if !ctx_positions.is_empty() {
+                self.ctx_viewport.fit_all(&ctx_positions, false);
+                self.ctx_fit_countdown = 0; // success — stop retrying
+            } else {
+                self.ctx_fit_countdown -= 1; // snapshot not ready yet, retry next frame
+            }
+        }
+
+        // Choose filter and viewport based on active tab
+        let (filter, vp) = match self.active_tab {
+            GraphTab::KnowledgeGraph => (self.filter_mode, &self.viewport),
+            GraphTab::ContextNodes => (FilterMode::InContextOnly, &self.ctx_viewport),
+        };
+
+        // Context tab: show placeholder if no context nodes
+        if self.active_tab == GraphTab::ContextNodes
+            && self.context_anchors.is_empty()
+            && self.context_in_context.is_empty()
+        {
+            render_context_placeholder(frame, area);
+            return;
+        }
+
         render::render_graph(
             frame,
             area,
             &self.snapshot,
-            &self.viewport,
+            vp,
             self.selected,
-            self.filter_mode,
+            filter,
             self.view_mode,
             &self.search_query,
             self.search_active,
@@ -199,13 +259,12 @@ impl GraphWidget {
 
         match key.code {
             // --- Viewport Navigation ---
-            KeyCode::Char('h') => self.viewport.pan(-10.0, 0.0),
-            KeyCode::Char('l') => self.viewport.pan(10.0, 0.0),
+            KeyCode::Char('h') => self.active_viewport_mut().pan(-10.0, 0.0),
+            KeyCode::Char('l') => self.active_viewport_mut().pan(10.0, 0.0),
             KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 if self.sorted_node_ids.is_empty() {
-                    self.viewport.pan(0.0, -10.0);
+                    self.active_viewport_mut().pan(0.0, -10.0);
                 } else {
-                    // Move selection up
                     if self.selection_index > 0 {
                         self.selection_index -= 1;
                     } else {
@@ -216,19 +275,21 @@ impl GraphWidget {
             }
             KeyCode::Char('j') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 if self.sorted_node_ids.is_empty() {
-                    self.viewport.pan(0.0, 10.0);
+                    self.active_viewport_mut().pan(0.0, 10.0);
                 } else {
-                    // Move selection down
                     self.selection_index =
                         (self.selection_index + 1) % self.sorted_node_ids.len().max(1);
                     self.selected = self.sorted_node_ids.get(self.selection_index).copied();
                 }
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => self.viewport.zoom_by(1.2),
-            KeyCode::Char('-') => self.viewport.zoom_by(1.0 / 1.2),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.active_viewport_mut().zoom_by(1.2),
+            KeyCode::Char('-') => self.active_viewport_mut().zoom_by(1.0 / 1.2),
             KeyCode::Esc => {
-                // Fit-all: reset viewport to show entire graph
-                self.viewport.fit_all(&self.snapshot.positions, true);
+                let positions = &self.snapshot.positions;
+                match self.active_tab {
+                    GraphTab::KnowledgeGraph => self.viewport.fit_all(positions, true),
+                    GraphTab::ContextNodes => self.ctx_viewport.fit_all(positions, true),
+                }
                 self.selected = None;
             }
 
@@ -236,23 +297,22 @@ impl GraphWidget {
             KeyCode::Enter => {
                 if let Some(sel_id) = self.selected {
                     if let Some(nv) = self.snapshot.node_views.get(&sel_id) {
-                        self.viewport.focus_node(nv.position);
+                        let pos = nv.position;
+                        match self.active_tab {
+                            GraphTab::KnowledgeGraph => self.viewport.focus_node(pos),
+                            GraphTab::ContextNodes => self.ctx_viewport.focus_node(pos),
+                        }
                     }
                 }
             }
 
-            // --- Tab: cycle through nodes ---
-            KeyCode::Tab => {
-                if !self.sorted_node_ids.is_empty() {
-                    self.selection_index =
-                        (self.selection_index + 1) % self.sorted_node_ids.len();
-                    self.selected = self.sorted_node_ids.get(self.selection_index).copied();
-                    if let Some(sel_id) = self.selected {
-                        if let Some(nv) = self.snapshot.node_views.get(&sel_id) {
-                            self.viewport.focus_node(nv.position);
-                        }
-                    }
-                }
+            // --- 1/2: switch between Knowledge Graph / Context Nodes tabs ---
+            KeyCode::Char('1') => {
+                self.active_tab = GraphTab::KnowledgeGraph;
+            }
+            KeyCode::Char('2') => {
+                self.active_tab = GraphTab::ContextNodes;
+                self.ctx_fit_countdown = 10;
             }
 
             // --- Search ---
@@ -323,13 +383,17 @@ impl GraphWidget {
     /// Handle mouse click inside graph area — select nearest node.
     /// `rel_col`/`rel_row` are relative to the graph inner area.
     pub fn handle_click(&mut self, rel_col: u16, rel_row: u16) {
+        let vp = match self.active_tab {
+            GraphTab::KnowledgeGraph => &self.viewport,
+            GraphTab::ContextNodes => &self.ctx_viewport,
+        };
         // Convert terminal cell to braille pixel coordinates
         let px = rel_col as f64 * 2.0;
         let py = rel_row as f64 * 4.0;
-        let world_pos = self.viewport.pixel_to_world(px, py);
+        let world_pos = vp.pixel_to_world(px, py);
 
         // Find nearest node within a threshold
-        let threshold = 5.0 / self.viewport.zoom.max(0.1); // scale threshold by zoom
+        let threshold = 5.0 / vp.zoom.max(0.1); // scale threshold by zoom
         let mut best: Option<(NodeId, f64)> = None;
 
         for (id, pos) in &self.snapshot.positions {
@@ -354,12 +418,12 @@ impl GraphWidget {
     pub fn handle_scroll_up(&mut self) {
         if let Some(id) = self.selected {
             if let Some(&pos) = self.snapshot.positions.get(&id) {
-                self.viewport.zoom_towards(pos, 1.15);
+                self.active_viewport_mut().zoom_towards(pos, 1.15);
             } else {
-                self.viewport.zoom_by(1.15);
+                self.active_viewport_mut().zoom_by(1.15);
             }
         } else {
-            self.viewport.zoom_by(1.15);
+            self.active_viewport_mut().zoom_by(1.15);
         }
         if let Some(ref lt) = self.layout_thread {
             lt.wake();
@@ -368,10 +432,15 @@ impl GraphWidget {
 
     /// Handle mouse scroll down (zoom out from center, not locked to node).
     pub fn handle_scroll_down(&mut self) {
-        self.viewport.zoom_by(0.87);
+        self.active_viewport_mut().zoom_by(0.87);
         if let Some(ref lt) = self.layout_thread {
             lt.wake();
         }
+    }
+
+    /// Trigger auto fit-all for context tab on next render.
+    pub fn set_ctx_fit_pending(&mut self) {
+        self.ctx_fit_countdown = 10;
     }
 
     /// Get reference to pinned node IDs (for context builder).
@@ -404,6 +473,9 @@ impl GraphWidget {
             );
             lt.wake();
         }
+
+        // Trigger auto fit-all for context tab on next render
+        self.ctx_fit_countdown = 10;
     }
 }
 
@@ -451,6 +523,31 @@ fn render_placeholder(frame: &mut Frame, area: Rect) {
         )),
         Line::from(Span::styled(
             "  p/P      Pin/Exclude",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]);
+    frame.render_widget(placeholder, area);
+}
+
+/// Render placeholder when Context Nodes tab has no context yet.
+fn render_context_placeholder(frame: &mut Frame, area: Rect) {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    let placeholder = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Context Nodes",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  No context yet. Ask a question",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  in chat to see context nodes.",
             Style::default().fg(Color::DarkGray),
         )),
     ]);

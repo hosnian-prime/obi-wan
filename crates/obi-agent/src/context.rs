@@ -200,46 +200,54 @@ impl ContextBuilder {
         // Force pinned nodes
         Self::apply_pinned(pinned, excluded, &mut candidates);
 
-        // Token packing with file-based content reading
-        Self::pack_and_assemble_from_files(
+        // Build content map by reading from source files
+        let content_map: HashMap<NodeId, String> = candidates.keys()
+            .filter_map(|id| {
+                let node = graph.get_node(id)?;
+                let content = read_node_content(project_root, &node.file_path, &node.line_range)?;
+                Some((*id, content))
+            })
+            .collect();
+
+        Ok(Self::pack_with_content(
             candidates,
+            &content_map,
             token_budget,
             graph,
-            project_root,
             &anchor_ids,
             max_node_tokens,
-        )
+        ))
     }
 
-    /// Step 3-4 for graph-only mode: reads content from source files.
-    fn pack_and_assemble_from_files(
+    /// Shared greedy token packing + context assembly.
+    /// Content is provided as a pre-built map (from LanceDB or file reads).
+    fn pack_with_content(
         candidates: HashMap<NodeId, f64>,
+        content_map: &HashMap<NodeId, String>,
         token_budget: usize,
         graph: &KnowledgeGraph,
-        project_root: &Path,
         anchor_ids: &[NodeId],
         max_node_tokens: usize,
-    ) -> Result<ContextWindow> {
-        let mut sorted_candidates: Vec<(NodeId, f64)> = candidates.into_iter().collect();
-        sorted_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ) -> ContextWindow {
+        let mut sorted: Vec<(NodeId, f64)> = candidates.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut selected: Vec<ContextNode> = Vec::new();
         let mut remaining = token_budget;
         let mut naive_tokens: usize = 0;
 
-        for (node_id, score) in sorted_candidates {
+        for (node_id, score) in sorted {
             if remaining < MIN_REMAINING_TOKENS {
                 break;
             }
 
-            let node_meta = match graph.get_node(&node_id) {
-                Some(node) => node,
+            let content = match content_map.get(&node_id) {
+                Some(c) => c.clone(),
                 None => continue,
             };
 
-            // Read content from source file
-            let content = match read_node_content(project_root, &node_meta.file_path, &node_meta.line_range) {
-                Some(c) => c,
+            let node_meta = match graph.get_node(&node_id) {
+                Some(node) => node,
                 None => continue,
             };
 
@@ -281,14 +289,14 @@ impl ContextBuilder {
         let total_tokens = token_budget - remaining;
         let formatted = format_context(&selected, graph);
 
-        Ok(ContextWindow {
+        ContextWindow {
             nodes: selected,
             anchor_ids: anchor_ids.to_vec(),
             in_context_ids,
             total_tokens,
             formatted,
             naive_tokens,
-        })
+        }
     }
 
     /// Original single-brain build method (backward compatible).
@@ -459,9 +467,7 @@ impl ContextBuilder {
         }
     }
 
-    /// Step 3-4: Greedy token packing + context assembly for dual-brain.
-    /// Applies max_node_tokens truncation to large nodes (from brain.max_node_tokens config).
-    /// Uses batch content fetching (single DB query) instead of per-node lookups.
+    /// Step 3-4: Greedy token packing for dual-brain (batch fetch from LanceDB).
     async fn pack_and_assemble(
         candidates: HashMap<NodeId, f64>,
         token_budget: usize,
@@ -471,79 +477,17 @@ impl ContextBuilder {
         anchor_ids: &[NodeId],
         max_node_tokens: usize,
     ) -> Result<ContextWindow> {
-        let mut sorted_candidates: Vec<(NodeId, f64)> = candidates.into_iter().collect();
-        sorted_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Batch fetch all candidate contents in one query (instead of N individual lookups)
-        let all_ids: Vec<NodeId> = sorted_candidates.iter().map(|(id, _)| *id).collect();
+        let all_ids: Vec<NodeId> = candidates.keys().copied().collect();
         let content_map = dual_brain.get_contents_batch(&all_ids, embedding_dims).await?;
 
-        let mut selected: Vec<ContextNode> = Vec::new();
-        let mut remaining = token_budget;
-        let mut naive_tokens: usize = 0;
-
-        for (node_id, score) in sorted_candidates {
-            if remaining < MIN_REMAINING_TOKENS {
-                break;
-            }
-
-            let content = match content_map.get(&node_id) {
-                Some(c) => c.clone(),
-                None => continue,
-            };
-
-            // Truncate large nodes to max_node_tokens (docs/09-settings.md: brain.max_node_tokens)
-            let (content, token_count) = if max_node_tokens > 0 {
-                let raw_tokens = estimate_tokens(&content);
-                naive_tokens += raw_tokens;
-                if raw_tokens > max_node_tokens {
-                    let truncated = truncate_to_tokens(&content, max_node_tokens);
-                    let tc = estimate_tokens(&truncated);
-                    (truncated, tc)
-                } else {
-                    (content, raw_tokens)
-                }
-            } else {
-                let tc = estimate_tokens(&content);
-                naive_tokens += tc;
-                (content, tc)
-            };
-
-            if token_count <= remaining {
-                let node_meta = match graph.get_node(&node_id) {
-                    Some(node) => node,
-                    None => continue,
-                };
-
-                remaining -= token_count;
-                selected.push(ContextNode {
-                    node_id,
-                    name: node_meta.name.clone(),
-                    file_path: node_meta.file_path.to_string_lossy().to_string(),
-                    line_start: node_meta.line_range.start,
-                    line_end: node_meta.line_range.end,
-                    node_type: node_meta.node_type,
-                    content,
-                    score,
-                    token_count,
-                });
-            }
-        }
-
-        selected.sort_by_key(|n| type_priority(n.node_type));
-
-        let in_context_ids: Vec<NodeId> = selected.iter().map(|n| n.node_id).collect();
-        let total_tokens = token_budget - remaining;
-        let formatted = format_context(&selected, graph);
-
-        Ok(ContextWindow {
-            nodes: selected,
-            anchor_ids: anchor_ids.to_vec(),
-            in_context_ids,
-            total_tokens,
-            formatted,
-            naive_tokens,
-        })
+        Ok(Self::pack_with_content(
+            candidates,
+            &content_map,
+            token_budget,
+            graph,
+            anchor_ids,
+            max_node_tokens,
+        ))
     }
 }
 

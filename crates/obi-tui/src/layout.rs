@@ -115,8 +115,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     ])
                     .split(main_areas[i]);
 
+                use crate::widgets::graph::GraphTab;
+                use ratatui::text::{Line as TLine, Span as TSpan};
+                use ratatui::style::Modifier;
+
+                let (tab1_style, tab2_style) = match app.graph.active_tab {
+                    GraphTab::KnowledgeGraph => (
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    GraphTab::ContextNodes => (
+                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                };
+                let tab_title = TLine::from(vec![
+                    TSpan::raw(" "),
+                    TSpan::styled("Knowledge Graph", tab1_style),
+                    TSpan::styled(" | ", Style::default().fg(Color::DarkGray)),
+                    TSpan::styled("Context Nodes", tab2_style),
+                    TSpan::raw(" "),
+                ]);
                 let block = Block::default()
-                    .title(" Knowledge Graph ")
+                    .title(tab_title)
                     .borders(Borders::ALL)
                     .border_style(focused_border(app.focus, PanelFocus::Graph));
                 let inner = block.inner(graph_split[0]);

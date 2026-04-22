@@ -89,6 +89,15 @@ pub fn render_graph(
     // ── Draw edges (braille layer — behind everything) ──────────────────
 
     for edge in &snapshot.edges {
+        // When filtering (e.g. InContextOnly), skip edges where either node is filtered out
+        if !matches!(filter, FilterMode::All) {
+            let src_visible = snapshot.node_views.get(&edge.source).map_or(false, |nv| filter.matches(nv));
+            let tgt_visible = snapshot.node_views.get(&edge.target).map_or(false, |nv| filter.matches(nv));
+            if !src_visible || !tgt_visible {
+                continue;
+            }
+        }
+
         let pos_a = match snapshot.positions.get(&edge.source) {
             Some(p) => *p,
             None => continue,
